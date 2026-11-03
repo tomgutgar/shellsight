@@ -178,6 +178,32 @@ CASES = [
     ("tcpdump -w cap.pcap", WRITE),
     ("echo a#b; rm -rf /", DANGER),         # '#' inside a word is not a comment
     ("ls 'unclosed; rm -rf /", READ),       # unclosed quote: everything is one string
+    # false positives found analyzing a long read-only script
+    ("(( x >= 1 && y > 2 ))", READ),        # arithmetic, not a redirection
+    ("if (( n > 0 )); then echo ok; fi", READ),
+    ("for ((i = 0; i < 3; i++)); do echo $i; done", READ),
+    ("(( $(rm x) > 0 ))", WRITE),           # substitutions inside arithmetic still count
+    ("[[ $a > $b ]] && echo y", READ),      # string comparison inside [[ ]]
+    ("[[ -f a && ! -L a ]] && cat a", READ),
+    ("[[ $x =~ ^(a|b)$ ]] && ls", READ),
+    ("case $d in /proc|/proc/*|/sys) echo no ;; esac", READ),   # patterns are not commands
+    ("case $x in\n  a|b) rm f ;;\n  *) ls ;;\nesac", WRITE),
+    ("case $x in (a) ls ;; esac\nrm y", WRITE),
+    ("note() { echo hi; }\nnote x", READ),  # call to a function defined in the script
+    ("function note { echo hi; }\nnote", READ),
+    ("wipe() { rm -f x; }\nwipe", WRITE),   # the body is still analyzed
+    ("awk '{ printf \"%d\\n\", ($5 >= 0) ? 1 : 0 }'", READ),
+    ("awk '{ print (a > b) }'", READ),
+    ("awk '$2 > 0 { print $1 }'", READ),
+    ("awk '{ print \"a|b\" \"x > y\" }'", READ),
+    ("awk '{ print $1 > \"out\" }'", EXEC),
+    ("awk 'BEGIN { printf(\"x\") > \"/tmp/f\" }'", EXEC),
+    ("awk '{ print $1 | \"sort\" }'", EXEC),
+    ("﻿ls -la", READ),                 # UTF-8 BOM (PowerShell pipes add one)
+    ("arr=(-l \"$x\" '(' -type f ')')", READ),   # array assignment: elements are data
+    ("arr+=(rm -rf /)", READ),
+    ("arr=($(rm x))", WRITE),
+    ("systemd-detect-virt", READ),
 ]
 
 
@@ -198,6 +224,13 @@ class TestLevels(unittest.TestCase):
 
     def test_root_is_mentioned(self):
         self.assertIn("as root", analyze("sudo rm x")[0][2])
+
+    def test_bom_is_stripped(self):
+        self.assertEqual(analyze("﻿ls -la")[0][1], "ls -la")
+
+    def test_function_name_does_not_leak_between_analyses(self):
+        analyze("frobnicate() { echo hi; }")
+        self.assertEqual(worst(analyze("frobnicate")), UNKNOWN)
 
     def test_empty(self):
         self.assertEqual(analyze("   \n# just a comment\n"), [])

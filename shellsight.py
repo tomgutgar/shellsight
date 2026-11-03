@@ -146,6 +146,11 @@ def tokenize(text):
             j = _balanced(text, i + 2)
             word.append(text[i:j + 1])
             has_word, i = True, j + 1
+        elif text.startswith("((", i) and not has_word and text.startswith(")", _balanced(text, i + 2) + 1):
+            j = _balanced(text, i + 2)  # "(( expr ))": arithmetic, its < and > are not redirections
+            toks.extend(["sub", s] for s in _subs_in_double(text[i + 2:j]))
+            toks.append(["w", text[i:j + 2]])
+            i = j + 2
         elif text.startswith("$(", i) or (c in "<>" and text.startswith("(", i + 1) and not has_word):
             j = _balanced(text, i + 2)
             toks.append(["sub", text[i + 2:j]])
@@ -176,6 +181,11 @@ def tokenize(text):
             if not (toks and toks[-1][0] == "op" and toks[-1][1] in CONTINUE_OPS):
                 toks.append(["op", "\n"])
             i += 1
+        elif c == "(" and ASSIGN.match("".join(word) + "x") and "".join(word).endswith("="):
+            j = _balanced(text, i + 1)  # "name=( ... )" array assignment: elements are data
+            toks.extend(t for t in tokenize(text[i + 1:j]) if t[0] == "sub")
+            word.append(text[i:j + 1])
+            i = j + 1
         elif c in "<>&|;()":
             op = next(o for o in OPS if text.startswith(o, i))
             if op[0] in "<>" and "".join(word).isdigit():  # file descriptor, e.g. 2>
@@ -198,18 +208,34 @@ def tokenize(text):
     return toks
 
 
-def split_commands(toks):
-    """Group tokens into simple commands (dicts with words, redirs, heredocs, subs, piped_from)."""
+def split_commands(toks, defined=None):
+    """Group tokens into simple commands (dicts with words, redirs, heredocs, subs, piped_from).
+    Names of the functions defined in toks are added to the set `defined`."""
     def new(piped_from=None):
         return {"words": [], "redirs": [], "heredocs": [], "subs": [], "piped_from": piped_from}
 
     def filled(c):
         return any(c[k] for k in ("words", "redirs", "heredocs", "subs"))
 
+    def head(c):  # words after leading keywords (if, then, !, ...)
+        ws = c["words"]
+        k = 0
+        while k < len(ws) and ws[k] in KEYWORDS:
+            k += 1
+        return ws[k:]
+
+    defined = set() if defined is None else defined
     cmds, cur, expect, parens = [], new(), None, 0
+    in_test, cases, in_pattern = False, 0, False
     for k, (kind, val) in enumerate(toks):
         if kind == "sub":
             cur["subs"].append(val)
+            continue
+        if in_pattern:  # "a|b)" in a case statement: patterns are not commands
+            if kind == "w" and val == "esac":
+                cases, in_pattern = cases - 1, False
+            elif kind == "op" and val == ")":
+                in_pattern = False
             continue
         if expect:
             if kind == "w":
@@ -217,13 +243,34 @@ def split_commands(toks):
                 expect = None
                 continue
             expect = None
+        if in_test and kind == "op" and val not in ("\n", ";", ";;"):
+            cur["words"].append(val)  # inside [[ ]]: < > && || ( ) are operands, not shell syntax
+            continue
         if kind == "w":
+            if val == "esac" and cases and not head(cur):
+                cases -= 1
+                continue
             cur["words"].append(val)
+            ws = head(cur)
+            if ws == ["[["]:
+                in_test = True
+            elif val == "]]":
+                in_test = False
+            if len(ws) == 2 and ws[0] == "function":
+                defined.add(val)
+            if len(ws) == 3 and ws[0] == "case" and val == "in":
+                cmds.append(cur)
+                cur, cases, in_pattern = new(), cases + 1, True
         elif kind == "heredoc":
             cur["heredocs"].append(val)
+        elif val == ";;" and cases:
+            if filled(cur):
+                cmds.append(cur)
+            cur, in_pattern = new(), True
         elif val in REDIRECTS:
             expect = val
         elif val == "(" and len(cur["words"]) == 1 and toks[k + 1:k + 2] == [["op", ")"]]:
+            defined.add(cur["words"][0])
             cur = new()  # "name() {" function definition header; the body is analyzed normally
             parens += 1
         else:
@@ -265,7 +312,7 @@ shopt read local declare typeset readonly trap ulimit umask exit return break co
 getopts let jobs fg bg disown logname tty locale zcat bzcat xzcat zstdcat zless zmore numfmt expr bc
 dc factor shuf apt-cache dpkg-query systemd-analyze lsb_release neofetch fastfetch inxi sensors
 tput clear stty namei ssh-keyscan look rev lvs vgs pvs lvdisplay vgdisplay pvdisplay
-lvscan vgscan pvscan
+lvscan vgscan pvscan systemd-detect-virt
 """)
 
 WRITE_CMDS = {
@@ -520,10 +567,35 @@ def rule_sed(args):
     return READ, "transforms text and prints it"
 
 
+AWK_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def awk_runs_or_writes(prog):
+    """True if an awk program can run commands or write files: system(), cmd | getline,
+    or print/printf redirected with > >> | outside parentheses (inside them it is a comparison)."""
+    p = AWK_STRING.sub('""', prog)
+    if re.search(r"\bsystem\s*\(|\|\s*getline|\|&", p):
+        return True
+    for m in re.finditer(r"\bprintf?\b", p):
+        depth, i = 0, m.end()
+        while i < len(p) and p[i] not in ";{}\n":
+            c = p[i]
+            if c in "([":
+                depth += 1
+            elif c in ")]":
+                depth -= 1
+            elif c == "|" and p.startswith("||", i):
+                i += 1
+            elif c in ">|" and depth <= 0:
+                return True
+            i += 1
+    return False
+
+
 def rule_awk(args):
     if has(args, "--inplace") or flag_value(args, "i", "--include") == "inplace":
         return WRITE, "edits files in place"
-    if any("system(" in a or re.search(r"\bprintf?\b[^;]*>\s*\S|\|\s*(\"|getline)", a) for a in args):
+    if any(awk_runs_or_writes(a) for a in args):
         return EXEC, "the awk program runs commands or writes files"
     if flag_value(args, "f", "--file"):
         return EXEC, "runs an awk program from a file (not checked)"
@@ -807,16 +879,24 @@ for _n in SUBCMDS:
 # --------------------------------------------------------------------------- analysis
 
 MAX_DEPTH = 12
+_FUNCS = set()  # functions defined in the text being analyzed
 
 
 def analyze(text, depth=0):
     """Analyze shell text. Return rows: (level, command, reason, depth)."""
+    global _FUNCS
     if depth > MAX_DEPTH:
         return [(UNKNOWN, text[:60], "nested too deep to analyze", depth)]
-    rows = []
-    for cmd in split_commands(tokenize(text)):
-        rows.extend(classify(cmd, depth))
-    return rows
+    if text.startswith("﻿"):  # UTF-8 BOM, e.g. added by PowerShell pipes
+        text = text[1:]
+    defined = set()
+    cmds = split_commands(tokenize(text), defined)
+    saved = _FUNCS
+    _FUNCS = (set() if depth == 0 else _FUNCS) | defined
+    try:
+        return [row for cmd in cmds for row in classify(cmd, depth)]
+    finally:
+        _FUNCS = saved
 
 
 def classify(cmd, depth):
@@ -831,7 +911,10 @@ def classify(cmd, depth):
         words = []
     if words and words[0] == "function":
         words = words[words.index("{") + 1:] if "{" in words else []
-    if words:
+    if words and words[0] in _FUNCS:
+        findings.append((READ, "calls %s, a function defined in this script "
+                               "(its commands are analyzed where it is defined)" % words[0]))
+    elif words:
         findings.extend(inspect(words, cmd, depth, nested))
     elif any(ASSIGN.match(w) for w in cmd["words"]):
         findings.append((READ, "sets a shell variable (not persistent)"))
@@ -882,6 +965,8 @@ def _child_level(nested, depth, floor=READ):
 
 def _inspect(words, cmd, depth, nested):
     raw, args = words[0], words[1:]
+    if raw.startswith("((") and raw.endswith("))"):
+        return [(READ, "arithmetic expression (only changes shell variables)")]
     if raw.startswith(("$(", "`")):
         if re.search(r"\b(curl|wget)\b", raw):
             return [(DANGER, "runs code downloaded from the internet")]
